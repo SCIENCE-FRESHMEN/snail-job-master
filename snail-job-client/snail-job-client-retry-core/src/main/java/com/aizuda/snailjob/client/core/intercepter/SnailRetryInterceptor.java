@@ -1,0 +1,368 @@
+package com.aizuda.snailjob.client.core.intercepter;
+
+import cn.hutool.core.collection.CollUtil;
+import cn.hutool.core.util.IdUtil;
+import com.aizuda.snailjob.client.common.cache.GroupVersionCache;
+import com.aizuda.snailjob.client.common.config.SnailJobProperties;
+import com.aizuda.snailjob.client.core.MethodResult;
+import com.aizuda.snailjob.client.core.RetryCondition;
+import com.aizuda.snailjob.client.core.annotation.Retryable;
+import com.aizuda.snailjob.client.core.cache.RetryerInfoCache;
+import com.aizuda.snailjob.client.core.intercepter.RetrySiteSnapshot.DefaultMethodEntranceMeta;
+import com.aizuda.snailjob.client.core.intercepter.RetrySiteSnapshot.MethodEntranceMeta;
+import com.aizuda.snailjob.client.core.intercepter.RetrySiteSnapshot.ParamsCopyMethodEntranceMeta;
+import com.aizuda.snailjob.client.core.intercepter.RetrySiteSnapshot.ParamsReferenceMethodEntranceMeta;
+import com.aizuda.snailjob.client.core.retryer.MethodParamsType;
+import com.aizuda.snailjob.client.core.retryer.RetryerInfo;
+import com.aizuda.snailjob.client.core.retryer.RetryerResultContext;
+import com.aizuda.snailjob.client.core.strategy.RetryStrategy;
+import com.aizuda.snailjob.common.core.alarm.AlarmContext;
+import com.aizuda.snailjob.common.core.alarm.SnailJobAlarmFactory;
+import com.aizuda.snailjob.common.core.context.SnailSpringContext;
+import com.aizuda.snailjob.common.core.enums.RetryNotifySceneEnum;
+import com.aizuda.snailjob.common.core.enums.RetryResultStatusEnum;
+import com.aizuda.snailjob.common.core.model.SnailJobHeaders;
+import com.aizuda.snailjob.common.core.util.EnvironmentUtils;
+import com.aizuda.snailjob.common.core.util.NetUtil;
+import com.aizuda.snailjob.common.log.SnailJobLog;
+import com.aizuda.snailjob.model.request.ConfigRequest;
+import com.aizuda.snailjob.model.request.ConfigRequest.Notify.Recipient;
+import com.google.common.base.Defaults;
+import com.google.common.collect.Lists;
+import org.aopalliance.intercept.MethodInterceptor;
+import org.aopalliance.intercept.MethodInvocation;
+import org.apache.commons.lang.ClassUtils;
+import org.springframework.aop.AfterAdvice;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+
+import java.io.Serializable;
+import java.lang.reflect.Method;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+import static com.aizuda.snailjob.common.core.constant.SystemConstants.YYYY_MM_DD_HH_MM_SS;
+
+/**
+ * @author opensnail
+ * @date 2023-08-23
+ */
+public class SnailRetryInterceptor implements MethodInterceptor, AfterAdvice, Serializable, Ordered {
+
+    private static final DateTimeFormatter formatter = DateTimeFormatter.ofPattern(YYYY_MM_DD_HH_MM_SS);
+    private static final String retryErrorMoreThresholdTextMessageFormatter =
+            "<font face=\"微软雅黑\" color=#ff0000 size=4>{}环境 重试组件异常</font>  \n" +
+                    "> IP:{}  \n" +
+                    "> 空间ID:{}  \n" +
+                    "> 名称:{}  \n" +
+                    "> 时间:{}  \n" +
+                    "> 异常:{}  \n";
+
+    private final RetryStrategy retryStrategy;
+    private final int order;
+
+    public SnailRetryInterceptor(int order, RetryStrategy localRetryStrategies) {
+        this.order = order;
+        this.retryStrategy = localRetryStrategies;
+    }
+
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+
+        String traceId = UUID.randomUUID().toString();
+
+        SnailJobLog.LOCAL.debug("Start entering the around method traceId:[{}]", traceId);
+
+        MethodEntranceMeta methodEntranceMeta = buildMethodEntranceMeta(invocation);
+
+        if (methodEntranceMeta.isRequiresNew()) {
+            // 如果已经是入口了就不需要继续添加入口了
+            if (!RetrySiteSnapshot.isMethodEntrance(methodEntranceMeta)) {
+                // 这里需要挂起外部重试的内存的信息
+                if (RetrySiteSnapshot.isRunning()
+                        && RetrySiteSnapshot.getStage() == RetrySiteSnapshot.EnumStage.LOCAL.getStage()) {
+                    RetrySiteSnapshot.suspend();
+                    // 清除线程信息
+                    RetrySiteSnapshot.removeAll();
+                }
+                // 设置新的内容信息
+                RetrySiteSnapshot.setMethodEntranceMeta(methodEntranceMeta);
+            }
+        } else if (!RetrySiteSnapshot.existedMethodEntrance()) {
+            RetrySiteSnapshot.setMethodEntranceMeta(methodEntranceMeta);
+        } else {
+            SnailJobLog.LOCAL.debug("No need to set entrance signs:[{}]", traceId);
+        }
+
+        Throwable throwable = null;
+        Object result = null;
+        RetryerResultContext retryerResultContext;
+        try {
+            result = invocation.proceed();
+        } catch (Throwable t) {
+            throwable = t;
+        } finally {
+
+            SnailJobLog.LOCAL.debug("Start retrying. traceId:[{}] scene:[{}] executorClassName:[{}]", traceId,
+                    methodEntranceMeta.getRetryable().scene(), methodEntranceMeta.getExecutorClassName());
+            // 入口则开始处理重试
+            retryerResultContext = doHandlerRetry(traceId, methodEntranceMeta, throwable, result);
+        }
+
+        SnailJobLog.LOCAL.debug("Method return value is [{}]. traceId:[{}]", result, traceId, throwable);
+
+        // 若是重试完成了, 则判断是否返回重试完成后的数据
+        if (Objects.nonNull(retryerResultContext)) {
+            // 重试成功直接返回结果
+            if (retryerResultContext.getRetryResultStatusEnum().getStatus()
+                    .equals(RetryResultStatusEnum.SUCCESS.getStatus())) {
+                return retryerResultContext.getResult();
+            }
+            // 若注解配置了isThrowException=false 则不抛出异常, 必须存在异常的情况
+            else if (!methodEntranceMeta.isThrowException() && Objects.nonNull(throwable)) {
+                return retryFailHandle(methodEntranceMeta, throwable, traceId, retryerResultContext);
+            }
+        }
+
+        // 无需开启重试的场景，需要清除缓存信息
+        if ((RetrySiteSnapshot.isMethodEntrance(methodEntranceMeta) && !RetrySiteSnapshot.isRunning())) {
+            RetrySiteSnapshot.removeSuspend();
+            RetrySiteSnapshot.removeAll();
+        }
+
+        if (throwable != null) {
+            throw throwable;
+        } else {
+            return result;
+        }
+
+    }
+
+    private boolean retryIfResult(Object result, Retryable retryable, String traceId, String executorClassName) {
+        try {
+            Class<? extends RetryCondition> retryConditionClass = retryable.retryIfResult();
+            if (Objects.nonNull(retryConditionClass) && !retryConditionClass.isAssignableFrom(RetryCondition.NoRetry.class)) {
+                RetryCondition retryCondition = retryConditionClass.getDeclaredConstructor().newInstance();
+                return retryCondition.shouldRetry(result);
+            }
+        } catch (Throwable e) {
+            SnailJobLog.LOCAL.debug("Retry condition fail. traceId:[{}] scene:[{}] executorClassName:[{}]", traceId,
+                    retryable.scene(), executorClassName);
+        }
+        return false;
+    }
+
+    private static Object retryFailHandle(MethodEntranceMeta methodEntranceMeta, Throwable throwable, String traceId, RetryerResultContext retryerResultContext) {
+
+        MethodInvocation invocation = methodEntranceMeta.getMethodInvocation();
+        Retryable retryable = methodEntranceMeta.getRetryable();
+        String executorClassName = methodEntranceMeta.getExecutorClassName();
+        Method method = invocation.getMethod();
+
+        // 如果存在用户自定义MethodResult，返回用户自定义值
+        try {
+            Class<? extends MethodResult> methodResultClass = retryable.methodResult();
+            if (Objects.nonNull(methodResultClass) && !methodResultClass.isAssignableFrom(MethodResult.NoMethodResult.class)) {
+                MethodResult methodResult = methodResultClass.getDeclaredConstructor().newInstance();
+                Object resultObj = methodResult.result(retryable.scene(), executorClassName, invocation.getArguments(), throwable);
+                Class<?> returnType = ClassUtils.primitiveToWrapper(method.getReturnType());
+                if (Objects.nonNull(resultObj) && returnType.isAssignableFrom(resultObj.getClass())) {
+                    return resultObj;
+                }
+            }
+        } catch (Throwable e) {
+            SnailJobLog.LOCAL.debug("Get method result is error. traceId:[{}] scene:[{}] executorClassName:[{}]", traceId, retryable.scene(), executorClassName, throwable);
+        }
+
+        // 若返回值是NULL且是基本类型则返回默认值
+        if (Objects.isNull(retryerResultContext.getResult()) && method.getReturnType().isPrimitive()) {
+            return Defaults.defaultValue(method.getReturnType());
+        }
+        return retryerResultContext.getResult();
+    }
+
+    private RetryerResultContext doHandlerRetry(String traceId, MethodEntranceMeta methodEntranceMeta, Throwable throwable, Object result) {
+
+        Retryable retryable = methodEntranceMeta.getRetryable();
+        String executorClassName = methodEntranceMeta.getExecutorClassName();
+
+        if (!RetrySiteSnapshot.isMethodEntrance(methodEntranceMeta)
+                || RetrySiteSnapshot.isRunning()
+                || (Objects.isNull(throwable) && !retryIfResult(result, retryable, traceId, executorClassName))
+                // 重试流量不开启重试
+                || RetrySiteSnapshot.isRetryFlow()
+                // 下游响应不重试码，不开启重试
+                || RetrySiteSnapshot.isRetryForStatusCode()
+                // 匹配异常信息
+                || !retryIfException(throwable, RetryerInfoCache.get(retryable.scene(), executorClassName))
+        ) {
+            if (!RetrySiteSnapshot.isMethodEntrance(methodEntranceMeta)) {
+                SnailJobLog.LOCAL.debug("Non-method entry does not enable local retries. traceId:[{}] [{}]", traceId,
+                        methodEntranceMeta.getMethodEntrance());
+            } else if (RetrySiteSnapshot.isRunning()) {
+                SnailJobLog.LOCAL.debug("Existing running retry tasks do not enable local retries. traceId:[{}] [{}]",
+                        traceId, RetrySiteSnapshot.EnumStage.valueOfStage(RetrySiteSnapshot.getStage()));
+            } else if (Objects.isNull(throwable)) {
+                SnailJobLog.LOCAL.debug("No exception, no local retries. traceId:[{}]", traceId);
+            } else if (RetrySiteSnapshot.isRetryFlow()) {
+                SnailJobLog.LOCAL.debug("Retry traffic does not enable local retries. traceId:[{}] [{}]", traceId,
+                        RetrySiteSnapshot.getRetryHeader());
+            } else if (RetrySiteSnapshot.isRetryForStatusCode()) {
+                SnailJobLog.LOCAL.debug("Existing exception retry codes do not enable local retries. traceId:[{}]",
+                        traceId);
+            } else if (!retryIfException(throwable, RetryerInfoCache.get(retryable.scene(), executorClassName))) {
+                SnailJobLog.LOCAL.debug("Exception mismatch. traceId:[{}]", traceId);
+            } else {
+                SnailJobLog.LOCAL.debug("Unknown situations do not enable local retry scenarios. traceId:[{}]",
+                        traceId);
+            }
+            return null;
+        }
+
+        return openRetry(traceId, methodEntranceMeta, throwable);
+    }
+
+    private RetryerResultContext openRetry(String traceId, MethodEntranceMeta methodEntranceMeta, Throwable throwable) {
+
+        try {
+
+            // 标识重试流量
+            initHeaders(methodEntranceMeta.getRetryable());
+
+            RetryerResultContext context = retryStrategy.openRetry(methodEntranceMeta.getRetryable().scene(), methodEntranceMeta.getExecutorClassName(),
+                    methodEntranceMeta::getMethodParams);
+            if (RetryResultStatusEnum.SUCCESS.getStatus().equals(context.getRetryResultStatusEnum().getStatus())) {
+                SnailJobLog.LOCAL.debug("local retry successful. traceId:[{}] result:[{}]", traceId,
+                        context.getResult());
+            } else {
+                SnailJobLog.LOCAL.debug("local retry result. traceId:[{}] throwable:[{}]", traceId,
+                        context.getThrowable());
+            }
+
+            return context;
+        } catch (Exception e) {
+            SnailJobLog.LOCAL.error("retry component handling exception，traceId:[{}]", traceId, e);
+
+            // 预警
+            sendMessage(e);
+
+        } finally {
+            // 清除当前重试的信息
+            RetrySiteSnapshot.removeAll();
+            // 还原挂起的信息
+            RetrySiteSnapshot.restore();
+
+        }
+
+        return null;
+    }
+
+    private void initHeaders(final Retryable retryable) {
+
+        SnailJobHeaders snailJobHeaders = new SnailJobHeaders();
+        snailJobHeaders.setRetry(Boolean.TRUE);
+        snailJobHeaders.setRetryId(IdUtil.getSnowflakeNextIdStr());
+        snailJobHeaders.setDdl(GroupVersionCache.getDdl(retryable.scene()));
+        RetrySiteSnapshot.setRetryHeader(snailJobHeaders);
+    }
+
+    private void sendMessage(Exception e) {
+
+        try {
+            ConfigRequest.Notify notify = GroupVersionCache.getRetryNotifyAttribute(
+                    RetryNotifySceneEnum.CLIENT_COMPONENT_ERROR.getNotifyScene());
+            if (Objects.nonNull(notify)) {
+                SnailJobProperties snailJobProperties = SnailSpringContext.getBean(SnailJobProperties.class);
+                if (Objects.isNull(snailJobProperties)) {
+                    return;
+                }
+                List<Recipient> recipients = Optional.ofNullable(notify.getRecipients()).orElse(Lists.newArrayList());
+                for (final Recipient recipient : recipients) {
+                    AlarmContext context = AlarmContext.build()
+                            .text(retryErrorMoreThresholdTextMessageFormatter,
+                                    EnvironmentUtils.getActiveProfile(),
+                                    NetUtil.getLocalIpStr(),
+                                    snailJobProperties.getNamespace(),
+                                    snailJobProperties.getGroup(),
+                                    LocalDateTime.now().format(formatter),
+                                    e.getMessage())
+                            .title("retry component handling exception:[{}]", snailJobProperties.getGroup())
+                            .notifyAttribute(recipient.getNotifyAttribute());
+
+                    Optional.ofNullable(SnailJobAlarmFactory.getAlarmType(recipient.getNotifyType()))
+                            .ifPresent(alarm -> alarm.asyncSendMessage(context));
+                }
+
+            }
+        } catch (Exception e1) {
+            SnailJobLog.LOCAL.error("Client failed to send component exception alert.", e1);
+        }
+
+    }
+
+    public MethodEntranceMeta buildMethodEntranceMeta(MethodInvocation invocation) {
+        Retryable retryable = getAnnotationParameter(invocation.getMethod());
+
+        if (retryable != null) {
+            MethodParamsType methodParamsType = retryable.methodParamsStrategy();
+            if (methodParamsType == MethodParamsType.REFERENCE) {
+                return new ParamsReferenceMethodEntranceMeta(invocation);
+            } else if (methodParamsType == MethodParamsType.DEEP_COPY) {
+                return new ParamsCopyMethodEntranceMeta(invocation);
+            }
+        }
+
+        return new DefaultMethodEntranceMeta(invocation);
+    }
+
+    private Retryable getAnnotationParameter(Method method) {
+
+        Retryable retryable = null;
+        if (method.isAnnotationPresent(Retryable.class)) {
+            //获取当前类的方法上标注的注解对象
+            retryable = method.getAnnotation(Retryable.class);
+        }
+
+        if (retryable == null) {
+            // 返回当前类或父类或接口方法上标注的注解对象
+            retryable = AnnotatedElementUtils.findMergedAnnotation(method, Retryable.class);
+        }
+
+        return retryable;
+    }
+
+    @Override
+    public int getOrder() {
+        return order;
+    }
+
+
+    private boolean retryIfException(Throwable throwable, RetryerInfo retryerInfo) {
+
+        Set<Class<? extends Throwable>> exclude = retryerInfo.getExclude();
+        Set<Class<? extends Throwable>> include = retryerInfo.getInclude();
+
+        if (CollUtil.isEmpty(include) && CollUtil.isEmpty(exclude)) {
+            return true;
+        }
+
+        for (Class<? extends Throwable> e : include) {
+            if (e.isAssignableFrom(throwable.getClass())) {
+                return true;
+            }
+        }
+
+        if (CollUtil.isNotEmpty(exclude)) {
+            for (Class<? extends Throwable> e : exclude) {
+                if (e.isAssignableFrom(throwable.getClass())) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+}
